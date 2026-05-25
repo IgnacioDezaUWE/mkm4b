@@ -44,7 +44,7 @@ sudo dnf install ffmpeg coreutils
 ## Installation
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/mkm4b.git
+git clone https://github.com/IgnacioDezaUWE/mkm4b.git
 cd mkm4b
 ./install.sh
 ```
@@ -97,6 +97,12 @@ mkm4b [DIRECTORY] [OPTIONS]
 | `-v` | Verbose: show full ffmpeg output |
 | `-h` | Help |
 | `--version` | Print version |
+
+**Performance:**
+
+| Option | Description |
+|---|---|
+| `--jobs=N` | Parallel encode jobs. Each file is encoded to AAC simultaneously; a fast `-c copy` pass then assembles the final M4B. Use `--jobs=-1` to use all CPU cores, or `--jobs=4` for a fixed number. Omit for sequential mode (default). |
 
 **Audio:**
 
@@ -186,9 +192,9 @@ A plain text file with one `key=value` per line. Lines starting with `#` are com
 ```
 # meta.txt
 title=Introduction to Machine Learning
-author=Dr Ignacio Deza
-album=Data Science Lectures 2024
-year=2024
+author= My Fav Lecturer
+album=Data Science Lectures 2026
+year=2026
 ```
 
 Pass it explicitly with `-m`, or just place it in the input folder as `meta.txt`
@@ -223,6 +229,12 @@ mkm4b lectures/ --trim-ends --silence-threshold=25
 # Override metadata without editing meta.txt
 mkm4b lectures/ --title="Viva: Jane Smith" --year=2026
 
+# Use all CPU cores — ideal for large backlogs
+mkm4b lectures/ --jobs=-1
+
+# Parallel encode + trim ends in one shot
+mkm4b lectures/ --jobs=-1 --trim-ends
+
 # Preview without writing
 mkm4b lectures/ -n
 
@@ -230,26 +242,28 @@ mkm4b lectures/ -n
 mkm4b lectures/ -v
 ```
 
-### Processing a backlog of folders
+### Processing many folders in parallel
 
 ```bash
 for folder in */; do
-  mkm4b "$folder" -s
+  mkm4b "$folder" -s --jobs=-1
 done
 ```
 
 The `-s` flag skips any folder that already has an output file, so you can
-safely re-run the loop after adding new folders. mkm4b auto-extracts metadata
-and cover art from each folder's files on the first run, then reuses them.
+safely re-run the loop after adding new folders. `--jobs=-1` uses all CPU cores
+for each folder, so encoding runs as fast as your hardware allows. mkm4b
+auto-extracts metadata and cover art from each folder's files on the first run,
+then reuses them.
 
 ---
 
 ## Tips
 
 - **File order** is determined by natural sort: you don't need to pad numbers manually. `lecture-2.mp3` and `lecture-10.mp3` sort correctly as-is.
-- **Existing tags are respected**: if your files already have cover art and metadata embedded (e.g. from a previous tagging session), mkm4b picks them up automatically with no extra flags.
-- **Dry run first**: `mkm4b lectures/ -n` shows you the file order, chapter layout, and full metadata block before committing to an encode.
-- **Re-encode freely**: the auto-extracted `meta.txt` and `cover.jpg` in each folder act as a persistent cache. Edit them before re-running to correct any tags.
+- **Existing tags are respected**: if your files already have cover art and metadata embedded, mkm4b picks them up automatically with no extra flags.
+- **Dry run**: `mkm4b lectures/ -n` shows you the file order, chapter layout, and full metadata block before committing to an encode.
+- **Re-encode**: the auto-extracted `meta.txt` and `cover.jpg` in each folder act as a persistent cache. Edit them before re-running to correct any tags.
 
 ---
 

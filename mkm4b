@@ -3,7 +3,7 @@
 emulate -L zsh
 set -euo pipefail
 
-VERSION="2.1.0"
+VERSION="2.2.0"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # helpers
@@ -17,7 +17,7 @@ info() { print "→  $*" }
 # ──────────────────────────────────────────────────────────────────────────────
 print_help() {
 cat <<'EOF'
-mkm4b v2.1 — convert a folder of audio files into a single M4B audiobook
+mkm4b v2.2 — convert a folder of audio files into a single M4B audiobook
 
 Usage:
   mkm4b [DIRECTORY] [OPTIONS]
@@ -34,6 +34,13 @@ Options:
   -v                        Verbose: show full ffmpeg output
   -h, --help                Show this help
   --version                 Print version and exit
+
+Performance:
+  --jobs=N                  Parallel encode jobs (default: 1 = sequential)
+                              --jobs=-1  use all CPU cores
+                              --jobs=4   use 4 cores
+                            Each file is encoded in parallel; a fast -c copy
+                            pass then assembles the final M4B.
 
 Audio:
   --mono                    Encode as mono 64k (default: stereo 128k)
@@ -86,7 +93,9 @@ Examples:
   mkm4b lectures/ -o ~/Audiobooks/ml.m4b -c silence=5
   mkm4b lectures/ --trim-ends --silence-threshold=25
   mkm4b lectures/ --title="My Viva Notes" --year=2026 --mono
-  for folder in */; do mkm4b "$folder" -s; done
+  mkm4b lectures/ --jobs=-1                  # use all CPU cores
+  mkm4b lectures/ --jobs=4 --trim-ends       # 4 cores + trim silence
+  for folder in */; do mkm4b "$folder" -s --jobs=-1; done
 EOF
 }
 
@@ -100,6 +109,14 @@ _install_hint() {
     Darwin) print "brew install $1" ;;
     Linux)  print "sudo apt install $2  # or: sudo dnf install $2" ;;
     *)      print "install GNU $1" ;;
+  esac
+}
+
+_get_cores() {
+  case "$(_os)" in
+    Darwin) sysctl -n hw.ncpu 2>/dev/null || print 4 ;;
+    Linux)  nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo 2>/dev/null || print 4 ;;
+    *)      print 4 ;;
   esac
 }
 
@@ -145,7 +162,7 @@ typeset -g  INPUT_DIR="" OUTPUT="" META_FILE="" COVER=""
 typeset -g  CHAPTER_MODE="files" SILENCE_SECS="3" SILENCE_THRESHOLD="35"
 typeset -g  TRIM_BUFFER="1.0"
 typeset -g  OPT_TITLE="" OPT_AUTHOR="" OPT_ALBUM="" OPT_YEAR=""
-typeset -gi RECURSIVE=0 FORCE=0 SKIP=0 DRYRUN=0 VERBOSE=0 MONO=0 TRIM_ENDS=0
+typeset -gi RECURSIVE=0 FORCE=0 SKIP=0 DRYRUN=0 VERBOSE=0 MONO=0 TRIM_ENDS=0 JOBS=0
 typeset -g  total_ms=0
 typeset -ga files=() durations=() chap_starts=() chap_titles=()
 
@@ -208,25 +225,21 @@ file_size_bytes() {
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Trim leading/trailing silence from a single file.
-# Uses SILENCE_THRESHOLD and TRIM_BUFFER globals.
-# Prints "path_to_use  new_dur_ms" to stdout:
-#   - If trimming happened: writes temp file, prints its path + new duration
-#   - If nothing to trim:   prints original path + original duration
+# Detect trim points for a file. Prints "trim_start_ms trimmed_dur_ms".
+# If no significant trim is needed, prints "0 orig_dur_ms".
+# Used by both trim_file_ends (sequential) and the parallel encode path.
 # ──────────────────────────────────────────────────────────────────────────────
-trim_file_ends() {
-  local f="$1" orig_dur_ms="$2" out_file="$3"
+get_trim_points() {
+  local f="$1" orig_dur_ms="$2"
   local noise="-${SILENCE_THRESHOLD}dB"
   local buffer_ms
   buffer_ms=$(awk "BEGIN { printf \"%d\", $TRIM_BUFFER * 1000 + 0.5 }")
 
-  # Detect silence (short min-duration to catch brief leading/trailing gaps)
   local sout=""
   sout=$(ffmpeg -i "$f" \
     -af "silencedetect=noise=${noise}:duration=0.1" \
     -f null - 2>&1 || true)
 
-  # Collect all silence_start and silence_end timestamps (ms)
   local -a ss_ms=() se_ms=()
   local line
   while IFS= read -r line; do
@@ -237,40 +250,49 @@ trim_file_ends() {
     fi
   done <<< "$sout"
 
-  local trim_start_ms=0
-  local trim_end_ms=$orig_dur_ms
+  local trim_start_ms=0 trim_end_ms=$orig_dur_ms
 
-  # Leading silence: only trim if file actually starts in silence (first
-  # silence_start within 100 ms of t=0) and we have a silence_end to aim for
   if (( ${#ss_ms[@]} > 0 && ss_ms[1] <= 100 && ${#se_ms[@]} > 0 )); then
     local speech_start=${se_ms[1]}
     trim_start_ms=$(( speech_start > buffer_ms ? speech_start - buffer_ms : 0 ))
   fi
 
-  # Trailing silence: only trim if file ends in silence (last silence_end
-  # within 500 ms of total duration)
   if (( ${#se_ms[@]} > 0 && se_ms[-1] >= orig_dur_ms - 500 && ${#ss_ms[@]} > 0 )); then
     local speech_end=${ss_ms[-1]}
     trim_end_ms=$(( speech_end + buffer_ms < orig_dur_ms ? speech_end + buffer_ms : orig_dur_ms ))
   fi
 
-  # Guard: trim points crossed or result too short (e.g. file is mostly/entirely
-  # silence — the leading and trailing calculations collide)
   local new_dur_ms=$(( trim_end_ms - trim_start_ms ))
-  if (( new_dur_ms < 500 )); then
-    print "$f $orig_dur_ms"
+
+  # Guard: crossed trim points (file mostly silence) or trivial savings
+  if (( new_dur_ms < 500 || (trim_start_ms < 100 && trim_end_ms > orig_dur_ms - 100) )); then
+    print "0 $orig_dur_ms"
     return
   fi
 
-  # Nothing meaningful to trim (< 100 ms savings on both ends)
-  if (( trim_start_ms < 100 && trim_end_ms > orig_dur_ms - 100 )); then
+  print "$trim_start_ms $new_dur_ms"
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Sequential trim: detect trim points and write a copy-trimmed file.
+# Prints "path_to_use new_dur_ms" — either the trimmed file or the original.
+# ──────────────────────────────────────────────────────────────────────────────
+trim_file_ends() {
+  local f="$1" orig_dur_ms="$2" out_file="$3"
+
+  local tp
+  tp=$(get_trim_points "$f" "$orig_dur_ms")
+  local trim_start_ms="${tp%% *}" new_dur_ms="${tp##* }"
+
+  # No trim needed
+  if [[ "$trim_start_ms" == "0" && "$new_dur_ms" == "$orig_dur_ms" ]]; then
     print "$f $orig_dur_ms"
     return
   fi
 
   local start_s dur_s
   start_s=$(awk "BEGIN { printf \"%.3f\", $trim_start_ms / 1000 }")
-  dur_s=$(awk "BEGIN { printf \"%.3f\", $new_dur_ms / 1000 }")
+  dur_s=$(awk   "BEGIN { printf \"%.3f\", $new_dur_ms    / 1000 }")
 
   if ffmpeg -hide_banner -loglevel error \
       -ss "$start_s" -t "$dur_s" -i "$f" \
@@ -417,7 +439,14 @@ auto_scan_meta() {
   local out_meta="$INPUT_DIR/meta.txt"
   {
     print "# Auto-extracted by mkm4b"
-    [[ -n "$title"  ]] && print "title=$title"
+    # The album tag names the collection; the per-file title tag names the
+    # individual session. For a multi-file M4B the collection name is the
+    # right title, so prefer album → title when both are present.
+    if [[ -n "$album" ]]; then
+      print "title=$album"
+    elif [[ -n "$title" ]]; then
+      print "title=$title"
+    fi
     [[ -n "$author" ]] && print "author=$author"
     [[ -n "$album"  ]] && print "album=$album"
     [[ -n "$year"   ]] && print "year=$year"
@@ -499,7 +528,7 @@ main() {
   CHAPTER_MODE="files" SILENCE_SECS="3" SILENCE_THRESHOLD="35"
   TRIM_ENDS=0 TRIM_BUFFER="1.0"
   OPT_TITLE="" OPT_AUTHOR="" OPT_ALBUM="" OPT_YEAR=""
-  RECURSIVE=0 FORCE=0 SKIP=0 DRYRUN=0 VERBOSE=0 MONO=0
+  RECURSIVE=0 FORCE=0 SKIP=0 DRYRUN=0 VERBOSE=0 MONO=0 JOBS=0
 
   # ── parse args ──────────────────────────────────────────────────────────────
   while [[ $# -gt 0 ]]; do
@@ -523,6 +552,14 @@ main() {
       -n)                    DRYRUN=1 ;;
       -v)                    VERBOSE=1 ;;
       --mono)                MONO=1 ;;
+      --jobs=*)
+        local _jv="${1#--jobs=}"
+        [[ "$_jv" =~ '^-?[0-9]+$' ]] \
+          || die "--jobs needs an integer (e.g. --jobs=4 or --jobs=-1 for all cores)"
+        JOBS="$_jv"
+        (( JOBS == 0 )) \
+          && die "--jobs=0 is not valid — use --jobs=1 for one job, or omit the flag for legacy sequential mode"
+        ;;
       --trim-ends)           TRIM_ENDS=1 ;;
       --trim-ends=*)         TRIM_ENDS=1; TRIM_BUFFER="${1#--trim-ends=}" ;;
       --silence-threshold=*) SILENCE_THRESHOLD="${1#--silence-threshold=}" ;;
@@ -548,6 +585,15 @@ main() {
     || die "--silence-threshold needs a positive number (e.g. --silence-threshold=35)"
   [[ "$TRIM_BUFFER" =~ '^[0-9]+(\.[0-9]+)?$' ]] \
     || die "--trim-ends value needs a positive number in seconds (e.g. --trim-ends=1.5)"
+
+  # ── resolve --jobs ──────────────────────────────────────────────────────────
+  if (( JOBS == -1 )); then
+    JOBS=$(_get_cores)
+    info "Parallel mode: using ${JOBS} core(s)"
+  elif (( JOBS < 0 )); then
+    die "--jobs must be -1 (all cores) or a positive integer"
+  fi
+  (( DRYRUN == 1 && JOBS != 0 )) && { warn "Dry run: --jobs ignored"; JOBS=0 }
 
   # ── dep check ───────────────────────────────────────────────────────────────
   check_deps
@@ -593,46 +639,140 @@ main() {
   local concat="$MKM4B_TMPDIR/concat.txt"
   local metafile="$MKM4B_TMPDIR/meta.ffmeta"
 
-  # ── probe / trim / concat list ──────────────────────────────────────────────
+  # ── audio + logging settings (shared by both encode paths) ──────────────────
+  local audio_channels=2 audio_bitrate="128k"
+  [[ $MONO -eq 1 ]] && { audio_channels=1; audio_bitrate="64k" }
+
+  local ff_loglevel="warning"
+  [[ $VERBOSE -eq 1 ]] && ff_loglevel="info"
+
+  # ── probe / trim / encode / concat list ──────────────────────────────────────
   durations=()
   total_ms=0
 
-  info "Probing files..."
-  [[ $TRIM_ENDS -eq 1 ]] && info "  (trimming ends to −${SILENCE_THRESHOLD} dBFS, ${TRIM_BUFFER}s buffer)"
+  if (( JOBS == 0 )); then
+    # ── sequential path: probe → optional trim → concat list ──────────────────
+    info "Probing files..."
+    [[ $TRIM_ENDS -eq 1 ]] && info "  (trimming ends to −${SILENCE_THRESHOLD} dBFS, ${TRIM_BUFFER}s buffer)"
 
-  local f dm orig_dm use_f secs_display orig_secs escaped trim_result
-  local idx=0
+    local f dm orig_dm use_f secs_display orig_secs escaped trim_result
+    local idx=0
 
-  for f in "${files[@]}"; do
-    (( ++idx )) || :
-    [[ -r "$f" ]] || die "Cannot read: $f"
+    for f in "${files[@]}"; do
+      (( ++idx )) || :
+      [[ -r "$f" ]] || die "Cannot read: $f"
 
-    orig_dm=$(probe_duration_ms "$f")
-    use_f="$f"
-    dm="$orig_dm"
+      orig_dm=$(probe_duration_ms "$f")
+      use_f="$f"
+      dm="$orig_dm"
 
-    if [[ $TRIM_ENDS -eq 1 ]]; then
-      local tmp_path="$MKM4B_TMPDIR/t${idx}.${f:e}"
-      trim_result=$(trim_file_ends "$f" "$orig_dm" "$tmp_path")
-      use_f="${trim_result%% *}"
-      dm="${trim_result##* }"
-    fi
+      if [[ $TRIM_ENDS -eq 1 ]]; then
+        local tmp_path="$MKM4B_TMPDIR/t${idx}.${f:e}"
+        trim_result=$(trim_file_ends "$f" "$orig_dm" "$tmp_path")
+        use_f="${trim_result%% *}"
+        dm="${trim_result##* }"
+      fi
 
-    durations+=($dm)
-    (( total_ms += dm )) || :
+      durations+=($dm)
+      (( total_ms += dm )) || :
 
-    secs_display=$(awk "BEGIN { printf \"%.1f\", $dm / 1000 }")
+      secs_display=$(awk "BEGIN { printf \"%.1f\", $dm / 1000 }")
 
-    if [[ "$use_f" != "$f" ]]; then
-      orig_secs=$(awk "BEGIN { printf \"%.1f\", $orig_dm / 1000 }")
-      info "  ✓ ${f:t}  (${orig_secs}s → ${secs_display}s)"
-    else
-      info "  ✓ ${f:t}  (${secs_display}s)"
-    fi
+      if [[ "$use_f" != "$f" ]]; then
+        orig_secs=$(awk "BEGIN { printf \"%.1f\", $orig_dm / 1000 }")
+        info "  ✓ ${f:t}  (${orig_secs}s → ${secs_display}s)"
+      else
+        info "  ✓ ${f:t}  (${secs_display}s)"
+      fi
 
-    escaped="${use_f//\'/\'\\\'\'}"
-    print "file '$escaped'" >> "$concat"
-  done
+      escaped="${use_f//\'/\'\\\'\'}"
+      print "file '$escaped'" >> "$concat"
+    done
+
+  else
+    # ── parallel encode path: probe → spawn AAC encode jobs → re-probe ────────
+    local n_files=${#files[@]}
+    info "Encoding ${n_files} file(s) with ${JOBS} parallel job(s)..."
+    [[ $TRIM_ENDS -eq 1 ]] && info "  (trimming ends to −${SILENCE_THRESHOLD} dBFS, ${TRIM_BUFFER}s buffer)"
+
+    # Suppress per-job output to avoid interleaved noise; verbose shows warnings
+    local ff_loglevel_enc="error"
+    [[ $VERBOSE -eq 1 ]] && ff_loglevel_enc="warning"
+
+    local -a enc_files=() enc_pids=()
+    local enc_head=0 enc_idx=0
+    local f enc_out enc_orig_dm enc_tp enc_tstart enc_tdur enc_ss enc_t
+
+    for f in "${files[@]}"; do
+      (( ++enc_idx )) || :
+      [[ -r "$f" ]] || die "Cannot read: $f"
+
+      enc_orig_dm=$(probe_duration_ms "$f")
+      enc_out="$MKM4B_TMPDIR/enc_${enc_idx}.m4a"
+      enc_files+=("$enc_out")
+
+      info "  [${enc_idx}/${n_files}] ${f:t}"
+
+      local -a ff_enc=(-hide_banner -loglevel "$ff_loglevel_enc")
+
+      if [[ $TRIM_ENDS -eq 1 ]]; then
+        enc_tp=$(get_trim_points "$f" "$enc_orig_dm")
+        enc_tstart="${enc_tp%% *}"
+        enc_tdur="${enc_tp##* }"
+        enc_ss=$(awk "BEGIN { printf \"%.3f\", $enc_tstart / 1000 }")
+        enc_t=$(awk  "BEGIN { printf \"%.3f\", $enc_tdur   / 1000 }")
+        ff_enc+=(-ss "$enc_ss" -t "$enc_t")
+      fi
+
+      ff_enc+=(
+        -i "$f"
+        -ar 44100 -ac $audio_channels
+        -c:a aac -b:a $audio_bitrate
+        -avoid_negative_ts make_zero
+        -vn "$enc_out" -y
+      )
+
+      # Concurrency gate: block until a worker slot is free
+      while (( ${#enc_pids[@]} - enc_head >= JOBS )); do
+        if ! kill -0 "${enc_pids[$((enc_head+1))]}" 2>/dev/null; then
+          if ! wait "${enc_pids[$((enc_head+1))]}"; then
+            warn "Encode job $((enc_head+1)) failed — ffmpeg output:"
+            cat "$MKM4B_TMPDIR/enc_$((enc_head+1)).log" >&2
+          fi
+          (( ++enc_head )) || :
+        else
+          sleep 0.05
+        fi
+      done
+
+      # Redirect per-job stderr to a log file; shown only on failure.
+      # This silences harmless source-file warnings (e.g. malformed ID3 GEOB
+      # frames) without hiding real errors.
+      ffmpeg "${ff_enc[@]}" 2>"$MKM4B_TMPDIR/enc_${enc_idx}.log" &
+      enc_pids+=($!)
+    done
+
+    # Drain remaining jobs
+    local drain_i
+    for (( drain_i = enc_head; drain_i < ${#enc_pids[@]}; drain_i++ )); do
+      if ! wait "${enc_pids[$((drain_i+1))]}"; then
+        warn "Encode job $((drain_i+1)) failed — ffmpeg output:"
+        cat "$MKM4B_TMPDIR/enc_$((drain_i+1)).log" >&2
+      fi
+    done
+
+    # Re-probe the encoded .m4a files to get accurate durations, build concat list
+    info "Probing encoded output..."
+    local ef dm escaped
+    for ef in "${enc_files[@]}"; do
+      [[ -f "$ef" ]] || die "Encoded file missing — an encode job failed: ${ef:t}"
+      dm=$(probe_duration_ms "$ef")
+      durations+=($dm)
+      (( total_ms += dm )) || :
+      escaped="${ef//\'/\'\\\'\'}"
+      print "file '$escaped'" >> "$concat"
+    done
+  fi
 
   local total_hms
   total_hms=$(awk "BEGIN {
@@ -694,17 +834,17 @@ main() {
     exit 0
   fi
 
-  # ── encode ──────────────────────────────────────────────────────────────────
-  info "Encoding → ${OUTPUT:t} ..."
-
-  local ff_loglevel="warning"
-  [[ $VERBOSE -eq 1 ]] && ff_loglevel="info"
+  # ── final assemble ───────────────────────────────────────────────────────────
+  # Sequential mode: concat + encode AAC in one pass.
+  # Parallel mode:   files are already AAC — just copy-concat into the M4B.
+  if (( JOBS == 0 )); then
+    info "Encoding → ${OUTPUT:t} ..."
+  else
+    info "Assembling → ${OUTPUT:t} ..."
+  fi
 
   local -a ff_overwrite=()
   [[ $FORCE -eq 1 ]] && ff_overwrite=(-y)
-
-  local audio_channels=2 audio_bitrate="128k"
-  [[ $MONO -eq 1 ]] && { audio_channels=1; audio_bitrate="64k" }
 
   local -a ff_inputs=(-f concat -safe 0 -i "$concat" -i "$metafile")
   local -a ff_maps=(-map 0:a -map_metadata 1)
@@ -723,14 +863,20 @@ main() {
     )
   fi
 
+  local -a ff_audio_enc=()
+  if (( JOBS == 0 )); then
+    ff_audio_enc=(-ar 44100 -ac $audio_channels -c:a aac -b:a $audio_bitrate)
+  else
+    ff_audio_enc=(-c:a copy)
+  fi
+
   ffmpeg \
     -hide_banner -loglevel "$ff_loglevel" -stats \
     "${ff_overwrite[@]}" \
     "${ff_inputs[@]}" \
     "${ff_maps[@]}" \
     "${ff_video[@]}" \
-    -ar 44100 -ac $audio_channels \
-    -c:a aac -b:a $audio_bitrate \
+    "${ff_audio_enc[@]}" \
     "${ff_cover_enc[@]}" \
     -movflags +faststart \
     "$OUTPUT"
