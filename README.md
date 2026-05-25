@@ -1,6 +1,6 @@
 # mkm4b
 
-Convert a folder of audio recordings into a single **M4B audiobook** — with chapters, cover art, and embedded metadata.
+Convert a folder of audio recordings into a single **M4B audiobook** with chapters, cover art, and embedded metadata.
 
 Designed for lectures, conference talks, student vivas, and anything else you'd rather listen to at 1.5× speed on your phone.
 
@@ -9,10 +9,10 @@ Designed for lectures, conference talks, student vivas, and anything else you'd 
 ## Features
 
 - Merges any number of audio files into one M4B
-- Embeds **chapter markers** — one per file, or split automatically at silence gaps
+- Embeds **chapter markers**: one per file, or split automatically at silence gaps
 - **Auto-detects** cover art and metadata already embedded in your files
 - Caches extracted `cover.jpg` and `meta.txt` in the folder so re-runs are instant
-- Natural sort order — `lecture-2` always comes before `lecture-10`
+- Natural sort order: `lecture-2` always comes before `lecture-10`
 - Works on **macOS and Linux**
 
 ---
@@ -63,7 +63,7 @@ That's it. The installer copies `mkm4b` to `/usr/local/bin`, checks that it's on
 ## Quick start
 
 ```bash
-# Convert a folder of recordings — chapters named after each file
+# Convert a folder of recordings: chapters named after each file
 mkm4b lectures/
 
 # Preview what will happen without writing anything
@@ -89,11 +89,11 @@ mkm4b [DIRECTORY] [OPTIONS]
 | `-o FILE` | Output file (default: `<dirname>.m4b` in current directory) |
 | `-m FILE` | Metadata file (key=value). Auto-detected if omitted. |
 | `-a IMAGE` | Cover art (jpg or png). Auto-detected if omitted. |
-| `-c MODE` | Chapter mode — see below (default: `files`) |
+| `-c MODE` | Chapter mode: see below (default: `files`) |
 | `-r` | Recurse into subdirectories |
 | `-f` | Overwrite existing output file |
 | `-s` | Skip silently if output already exists (useful in batch loops) |
-| `-n` | Dry run — show exactly what would happen, write nothing |
+| `-n` | Dry run: show exactly what would happen, write nothing |
 | `-v` | Verbose: show full ffmpeg output |
 | `-h` | Help |
 | `--version` | Print version |
@@ -102,9 +102,9 @@ mkm4b [DIRECTORY] [OPTIONS]
 
 | Option | Description |
 |---|---|
-| `--mono` | Encode as mono 64k (default: stereo 128k — good for recordings with spatial audio) |
+| `--mono` | Encode as mono 64k (default: stereo 128k: good for recordings with spatial audio) |
 
-**Metadata overrides** — set individual fields without a `meta.txt`:
+**Metadata overrides**: set individual fields without a `meta.txt`:
 
 | Option | Description |
 |---|---|
@@ -131,7 +131,7 @@ These take priority over `-m` and auto-detected values for that run only. The ca
 ### `files` (default)
 
 One chapter per input file. Chapter titles are taken from filenames with leading
-numbers stripped — so `03 - Introduction.mp3` becomes chapter `Introduction`.
+numbers stripped: so `03 - Introduction.mp3` becomes chapter `Introduction`.
 
 ```bash
 mkm4b lectures/ -c files
@@ -139,7 +139,7 @@ mkm4b lectures/ -c files
 
 ### `none`
 
-No chapter markers — just a single continuous audio stream.
+No chapter markers: just a single continuous audio stream.
 
 ```bash
 mkm4b lectures/ -c none
@@ -163,14 +163,14 @@ When you don't pass `-m` or `-a`, mkm4b looks inside the input folder and the au
 
 ### Cover art
 
-1. Looks for `cover.jpg` or `cover.png` in the input folder — uses it if valid
+1. Looks for `cover.jpg` or `cover.png` in the input folder: uses it if valid
 2. If not found, scans the audio files for embedded artwork and extracts it
 3. Saves the extracted image to the folder for next time
 4. If a file exists but is broken, backs it up to `cover2.jpg` and extracts a fresh copy
 
 ### Metadata
 
-1. Looks for `meta.txt` in the input folder — uses it if valid
+1. Looks for `meta.txt` in the input folder: uses it if valid
 2. If not found, reads embedded tags (`title`, `artist`, `album`, `date`) from the first file that has them
 3. Saves the extracted tags to `meta.txt` for next time
 4. If `meta.txt` exists but is empty or malformed, backs it up to `meta2.txt`
@@ -199,7 +199,7 @@ and mkm4b will find it automatically.
 ## Examples
 
 ```bash
-# Basic — chapters from filenames, auto-detect cover and metadata
+# Basic: chapters from filenames, auto-detect cover and metadata
 mkm4b lectures/
 
 # Custom output path
@@ -217,11 +217,11 @@ mkm4b course/ -r
 # Trim leading/trailing silence from each file, mono output
 mkm4b lectures/ --trim-ends --mono
 
-# Noisy room — more aggressive silence threshold
+# Noisy room: more aggressive silence threshold
 mkm4b lectures/ --trim-ends --silence-threshold=25
 
 # Override metadata without editing meta.txt
-mkm4b lectures/ --title="Viva — Jane Smith" --year=2026
+mkm4b lectures/ --title="Viva: Jane Smith" --year=2026
 
 # Preview without writing
 mkm4b lectures/ -n
@@ -246,10 +246,10 @@ and cover art from each folder's files on the first run, then reuses them.
 
 ## Tips
 
-- **File order** is determined by natural sort — you don't need to pad numbers manually. `lecture-2.mp3` and `lecture-10.mp3` sort correctly as-is.
-- **Existing tags are respected** — if your files already have cover art and metadata embedded (e.g. from a previous tagging session), mkm4b picks them up automatically with no extra flags.
-- **Dry run first** — `mkm4b lectures/ -n` shows you the file order, chapter layout, and full metadata block before committing to an encode.
-- **Re-encode freely** — the auto-extracted `meta.txt` and `cover.jpg` in each folder act as a persistent cache. Edit them before re-running to correct any tags.
+- **File order** is determined by natural sort: you don't need to pad numbers manually. `lecture-2.mp3` and `lecture-10.mp3` sort correctly as-is.
+- **Existing tags are respected**: if your files already have cover art and metadata embedded (e.g. from a previous tagging session), mkm4b picks them up automatically with no extra flags.
+- **Dry run first**: `mkm4b lectures/ -n` shows you the file order, chapter layout, and full metadata block before committing to an encode.
+- **Re-encode freely**: the auto-extracted `meta.txt` and `cover.jpg` in each folder act as a persistent cache. Edit them before re-running to correct any tags.
 
 ---
 
