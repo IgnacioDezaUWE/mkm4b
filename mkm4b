@@ -80,7 +80,7 @@ Metadata file format (lines starting with # are comments):
   title=My Lecture Series
   author=Dr Smith
   album=Advanced Topics
-  year=2024
+  year=2026
 
 Chapter modes:
   files       One chapter per input file (default)
@@ -92,7 +92,7 @@ Examples:
   mkm4b lectures/
   mkm4b lectures/ -o ~/Audiobooks/ml.m4b -c silence=5
   mkm4b lectures/ --trim-ends --silence-threshold=25
-  mkm4b lectures/ --title="My Viva Notes" --year=2026 --mono
+  mkm4b lectures/ --title="My Notes" --year=2026 --mono
   mkm4b lectures/ --jobs=-1                  # use all CPU cores
   mkm4b lectures/ --jobs=4 --trim-ends       # 4 cores + trim silence
   for folder in */; do mkm4b "$folder" -s --jobs=-1; done
@@ -168,8 +168,6 @@ typeset -ga files=() durations=() chap_starts=() chap_titles=()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Strip leading digits + separators from a filename stem
-#   "03 - Neural Networks" → "Neural Networks"
-#   "001_intro"            → "intro"
 # ──────────────────────────────────────────────────────────────────────────────
 clean_title() {
   local result
