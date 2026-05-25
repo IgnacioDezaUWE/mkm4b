@@ -1,0 +1,759 @@
+#!/usr/bin/env zsh
+
+emulate -L zsh
+set -euo pipefail
+
+VERSION="2.1.0"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# helpers
+# ──────────────────────────────────────────────────────────────────────────────
+die()  { print -u2 "❌  $*"; exit 1 }
+warn() { print -u2 "⚠️   $*" }
+info() { print "→  $*" }
+
+# ──────────────────────────────────────────────────────────────────────────────
+# help
+# ──────────────────────────────────────────────────────────────────────────────
+print_help() {
+cat <<'EOF'
+mkm4b v2.1 — convert a folder of audio files into a single M4B audiobook
+
+Usage:
+  mkm4b [DIRECTORY] [OPTIONS]
+
+Options:
+  -o FILE                   Output file (default: <dirname>.m4b in cwd)
+  -m FILE                   Metadata file (key=value). Auto-detected if omitted.
+  -a IMAGE                  Cover art (jpg/png). Auto-detected if omitted.
+  -c MODE                   Chapter mode: files | none | silence=SECS  (default: files)
+  -r                        Recurse into subdirectories
+  -f                        Overwrite existing output
+  -s                        Skip silently if output already exists
+  -n                        Dry run — show plan, write nothing
+  -v                        Verbose: show full ffmpeg output
+  -h, --help                Show this help
+  --version                 Print version and exit
+
+Audio:
+  --mono                    Encode as mono 64k (default: stereo 128k)
+
+Metadata overrides (override -m / auto-detected values for this run):
+  --title=TEXT              Set title
+  --author=TEXT             Set author
+  --album=TEXT              Set album
+  --year=TEXT               Set year
+
+Silence tuning:
+  --silence-threshold=N     Level below which audio counts as silence, in dB
+                              below full scale (default: 35 → −35 dBFS)
+                              Lower = quieter threshold; higher = more aggressive
+                              Try 25 for noisy rooms / loud AC
+  --trim-ends[=SECS]        Strip leading/trailing silence from each file before
+                              joining. Keeps SECS seconds of buffer (default: 1.0)
+                              Used with: -c files (trims around each chapter)
+
+Supported input formats:
+  mp3, m4a, aac, wav, flac
+
+Auto-detection (when -m / -a are omitted):
+  Looks for cover.jpg and meta.txt in the input folder. If absent, scans the
+  audio files for embedded tags/artwork and writes them to the folder as a
+  cache for future runs. Broken existing files are backed up to cover2.jpg /
+  meta2.txt with a warning.
+
+Metadata priority (highest → lowest):
+  --title / --author / --album / --year
+  -m file.txt
+  meta.txt in input folder  (auto-detected cache)
+  tags embedded in audio files
+  folder name  (title only, last resort)
+
+Metadata file format (lines starting with # are comments):
+  title=My Lecture Series
+  author=Dr Smith
+  album=Advanced Topics
+  year=2024
+
+Chapter modes:
+  files       One chapter per input file (default)
+  none        No chapter markers
+  silence=N   Chapter boundary at every gap >= N seconds (float ok: silence=3.5)
+              Falls back to 'files' mode with a warning if no silence found
+
+Examples:
+  mkm4b lectures/
+  mkm4b lectures/ -o ~/Audiobooks/ml.m4b -c silence=5
+  mkm4b lectures/ --trim-ends --silence-threshold=25
+  mkm4b lectures/ --title="My Viva Notes" --year=2026 --mono
+  for folder in */; do mkm4b "$folder" -s; done
+EOF
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# platform-aware dep lookup
+# ──────────────────────────────────────────────────────────────────────────────
+_os() { uname -s }
+
+_install_hint() {
+  case "$(_os)" in
+    Darwin) print "brew install $1" ;;
+    Linux)  print "sudo apt install $2  # or: sudo dnf install $2" ;;
+    *)      print "install GNU $1" ;;
+  esac
+}
+
+_find_sort() {
+  local cmd bin
+  for cmd in gsort sort; do
+    bin=$(command -v "$cmd" 2>/dev/null) || continue
+    if printf '1\n2\n10\n' | "$bin" -V >/dev/null 2>&1; then
+      print "$bin"; return
+    fi
+  done
+}
+
+_find_realpath() {
+  local cmd
+  for cmd in grealpath realpath; do
+    command -v "$cmd" 2>/dev/null && return
+  done
+}
+
+SORT="${SORT:-$(_find_sort)}"
+REALPATH="${REALPATH:-$(_find_realpath)}"
+
+check_deps() {
+  [[ -n "$SORT"     ]] || die "GNU sort not found — $(_install_hint coreutils coreutils)"
+  [[ -n "$REALPATH" ]] || die "realpath not found — $(_install_hint coreutils coreutils)"
+  command -v ffmpeg  >/dev/null 2>&1 || die "ffmpeg not found  — $(_install_hint ffmpeg ffmpeg)"
+  command -v ffprobe >/dev/null 2>&1 || die "ffprobe not found — $(_install_hint ffmpeg ffmpeg)"
+  command -v awk     >/dev/null 2>&1 || die "awk not found"
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Temp dir — global so the EXIT trap reaches it after main() returns
+# ──────────────────────────────────────────────────────────────────────────────
+MKM4B_TMPDIR=""
+cleanup() { [[ -n "$MKM4B_TMPDIR" ]] && rm -rf "$MKM4B_TMPDIR" }
+trap cleanup EXIT INT TERM
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Global state — written by main(), readable by helper functions
+# ──────────────────────────────────────────────────────────────────────────────
+typeset -g  INPUT_DIR="" OUTPUT="" META_FILE="" COVER=""
+typeset -g  CHAPTER_MODE="files" SILENCE_SECS="3" SILENCE_THRESHOLD="35"
+typeset -g  TRIM_BUFFER="1.0"
+typeset -g  OPT_TITLE="" OPT_AUTHOR="" OPT_ALBUM="" OPT_YEAR=""
+typeset -gi RECURSIVE=0 FORCE=0 SKIP=0 DRYRUN=0 VERBOSE=0 MONO=0 TRIM_ENDS=0
+typeset -g  total_ms=0
+typeset -ga files=() durations=() chap_starts=() chap_titles=()
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Strip leading digits + separators from a filename stem
+#   "03 - Neural Networks" → "Neural Networks"
+#   "001_intro"            → "intro"
+# ──────────────────────────────────────────────────────────────────────────────
+clean_title() {
+  local result
+  result=$(printf '%s' "$1" | sed 's/^[0-9][0-9]*[[:space:]._-]*//')
+  [[ -z "$result" ]] && result="$1"
+  printf '%s' "$result"
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Collect audio files into the global `files` array
+# ──────────────────────────────────────────────────────────────────────────────
+collect_files() {
+  local -a find_cmd=(find "$INPUT_DIR")
+  [[ $RECURSIVE -eq 0 ]] && find_cmd+=(-maxdepth 1)
+  find_cmd+=(
+    -type f
+    \(
+      -iname "*.mp3" -o -iname "*.m4a" -o -iname "*.aac"
+      -o -iname "*.wav" -o -iname "*.flac"
+    \)
+  )
+  local f
+  while IFS= read -r f; do
+    files+=("$f")
+  done < <("${find_cmd[@]}" | "$SORT" -V)
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Return duration of a file in milliseconds (stdout)
+# ──────────────────────────────────────────────────────────────────────────────
+probe_duration_ms() {
+  local f="$1" dur=""
+
+  dur=$(ffprobe -v error -select_streams a:0 \
+        -show_entries stream=duration \
+        -of default=noprint_wrappers=1:nokey=1 "$f" 2>/dev/null || true)
+
+  if [[ -z "$dur" || "$dur" == "N/A" ]]; then
+    dur=$(ffprobe -v error \
+          -show_entries format=duration \
+          -of default=noprint_wrappers=1:nokey=1 "$f" 2>/dev/null || true)
+  fi
+
+  [[ -n "$dur" && "$dur" != "N/A" ]] || die "Cannot determine duration of: ${f:t}"
+  awk "BEGIN { printf \"%d\", $dur * 1000 + 0.5 }"
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Return file size in bytes, cross-platform (stdout)
+# ──────────────────────────────────────────────────────────────────────────────
+file_size_bytes() {
+  stat -f%z "$1" 2>/dev/null || stat -c%s "$1" 2>/dev/null || print 0
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Trim leading/trailing silence from a single file.
+# Uses SILENCE_THRESHOLD and TRIM_BUFFER globals.
+# Prints "path_to_use  new_dur_ms" to stdout:
+#   - If trimming happened: writes temp file, prints its path + new duration
+#   - If nothing to trim:   prints original path + original duration
+# ──────────────────────────────────────────────────────────────────────────────
+trim_file_ends() {
+  local f="$1" orig_dur_ms="$2" out_file="$3"
+  local noise="-${SILENCE_THRESHOLD}dB"
+  local buffer_ms
+  buffer_ms=$(awk "BEGIN { printf \"%d\", $TRIM_BUFFER * 1000 + 0.5 }")
+
+  # Detect silence (short min-duration to catch brief leading/trailing gaps)
+  local sout=""
+  sout=$(ffmpeg -i "$f" \
+    -af "silencedetect=noise=${noise}:duration=0.1" \
+    -f null - 2>&1 || true)
+
+  # Collect all silence_start and silence_end timestamps (ms)
+  local -a ss_ms=() se_ms=()
+  local line
+  while IFS= read -r line; do
+    if [[ "$line" =~ 'silence_start: ([0-9]+\.?[0-9]*)' ]]; then
+      ss_ms+=( $(awk "BEGIN { printf \"%d\", ${match[1]} * 1000 + 0.5 }") )
+    elif [[ "$line" =~ 'silence_end: ([0-9]+\.?[0-9]*)' ]]; then
+      se_ms+=( $(awk "BEGIN { printf \"%d\", ${match[1]} * 1000 + 0.5 }") )
+    fi
+  done <<< "$sout"
+
+  local trim_start_ms=0
+  local trim_end_ms=$orig_dur_ms
+
+  # Leading silence: only trim if file actually starts in silence (first
+  # silence_start within 100 ms of t=0) and we have a silence_end to aim for
+  if (( ${#ss_ms[@]} > 0 && ss_ms[1] <= 100 && ${#se_ms[@]} > 0 )); then
+    local speech_start=${se_ms[1]}
+    trim_start_ms=$(( speech_start > buffer_ms ? speech_start - buffer_ms : 0 ))
+  fi
+
+  # Trailing silence: only trim if file ends in silence (last silence_end
+  # within 500 ms of total duration)
+  if (( ${#se_ms[@]} > 0 && se_ms[-1] >= orig_dur_ms - 500 && ${#ss_ms[@]} > 0 )); then
+    local speech_end=${ss_ms[-1]}
+    trim_end_ms=$(( speech_end + buffer_ms < orig_dur_ms ? speech_end + buffer_ms : orig_dur_ms ))
+  fi
+
+  # Guard: trim points crossed or result too short (e.g. file is mostly/entirely
+  # silence — the leading and trailing calculations collide)
+  local new_dur_ms=$(( trim_end_ms - trim_start_ms ))
+  if (( new_dur_ms < 500 )); then
+    print "$f $orig_dur_ms"
+    return
+  fi
+
+  # Nothing meaningful to trim (< 100 ms savings on both ends)
+  if (( trim_start_ms < 100 && trim_end_ms > orig_dur_ms - 100 )); then
+    print "$f $orig_dur_ms"
+    return
+  fi
+
+  local start_s dur_s
+  start_s=$(awk "BEGIN { printf \"%.3f\", $trim_start_ms / 1000 }")
+  dur_s=$(awk "BEGIN { printf \"%.3f\", $new_dur_ms / 1000 }")
+
+  if ffmpeg -hide_banner -loglevel error \
+      -ss "$start_s" -t "$dur_s" -i "$f" \
+      -c copy "$out_file" -y 2>/dev/null; then
+    print "$out_file $new_dur_ms"
+  else
+    warn "Trim failed for ${f:t} — using original"
+    print "$f $orig_dur_ms"
+  fi
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Echo silence_end timestamps (ms) within a file that are good chapter splits
+# ──────────────────────────────────────────────────────────────────────────────
+detect_silence_ends() {
+  local f="$1" file_dur_ms="$2" sout="" line="" se_ms=""
+
+  sout=$(ffmpeg -i "$f" \
+    -af "silencedetect=noise=-${SILENCE_THRESHOLD}dB:duration=${SILENCE_SECS}" \
+    -f null - 2>&1 || true)
+
+  while IFS= read -r line; do
+    if [[ "$line" =~ 'silence_end: ([0-9]+\.?[0-9]*)' ]]; then
+      se_ms=$(awk "BEGIN { printf \"%d\", ${match[1]} * 1000 + 0.5 }")
+      if (( se_ms > 1000 && se_ms < file_dur_ms - 1000 )); then
+        print "$se_ms"
+      fi
+    fi
+  done <<< "$sout"
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Validate a file is a usable image
+# ──────────────────────────────────────────────────────────────────────────────
+is_valid_image() {
+  ffprobe -v error -select_streams v:0 \
+    -show_entries stream=codec_name \
+    -of default=noprint_wrappers=1:nokey=1 "$1" 2>/dev/null | grep -qE 'mjpeg|jpeg|png'
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Auto-detect cover art. Sets global COVER.
+# ──────────────────────────────────────────────────────────────────────────────
+auto_scan_cover() {
+  local found_existing=""
+  local candidate
+  for candidate in "$INPUT_DIR/cover.jpg" "$INPUT_DIR/cover.png"; do
+    [[ -f "$candidate" ]] && { found_existing="$candidate"; break }
+  done
+
+  if [[ -n "$found_existing" ]]; then
+    if is_valid_image "$found_existing"; then
+      typeset -g COVER="$found_existing"
+      info "Cover: using existing ${found_existing:t}"
+      return
+    else
+      warn "${found_existing:t} exists but is not valid — will extract from files"
+    fi
+  fi
+
+  local f art_codec out_cover=""
+  for f in "${files[@]}"; do
+    art_codec=$(ffprobe -v error -select_streams v:0 \
+      -show_entries stream=codec_name \
+      -of default=noprint_wrappers=1:nokey=1 "$f" 2>/dev/null || true)
+    [[ -z "$art_codec" ]] && continue
+
+    local ext=".jpg"
+    [[ "$art_codec" == "png" ]] && ext=".png"
+    out_cover="$INPUT_DIR/cover${ext}"
+
+    if [[ -f "$out_cover" ]]; then
+      local backup="${out_cover:r}2.${out_cover:e}"
+      warn "Backing up broken ${out_cover:t} → ${backup:t}"
+      mv "$out_cover" "$backup"
+    fi
+
+    if ffmpeg -i "$f" -an -vcodec copy "$out_cover" -y 2>/dev/null; then
+      typeset -g COVER="$out_cover"
+      info "Cover: extracted from ${f:t} → ${out_cover:t}"
+    else
+      warn "Failed to extract cover art from ${f:t}"
+      out_cover=""
+    fi
+    break
+  done
+
+  [[ -z "$out_cover" ]] && info "Cover: none found"
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Validate a metadata file has at least one key=value line
+# ──────────────────────────────────────────────────────────────────────────────
+is_valid_meta() {
+  grep -qE '^[^#[:space:]][^=]*=.' "$1" 2>/dev/null
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Auto-detect metadata from folder or embedded tags. Sets global META_FILE.
+# ──────────────────────────────────────────────────────────────────────────────
+auto_scan_meta() {
+  local existing="$INPUT_DIR/meta.txt"
+
+  if [[ -f "$existing" ]]; then
+    if is_valid_meta "$existing"; then
+      typeset -g META_FILE="$existing"
+      info "Metadata: using existing meta.txt"
+      return
+    else
+      warn "meta.txt exists but has no valid entries — will extract from files"
+      mv "$existing" "$INPUT_DIR/meta2.txt"
+      warn "Backed up to meta2.txt"
+    fi
+  fi
+
+  local title="" author="" album="" year="" f line lkey val raw_key
+
+  for f in "${files[@]}"; do
+    while IFS= read -r line; do
+      raw_key="${line%%=*}"
+      val="${line#*=}"
+      lkey="${raw_key:l}"
+      lkey="${lkey##tag:}"
+      lkey="${lkey// /}"
+      case "$lkey" in
+        title)               [[ -z "$title"  ]] && title="$val" ;;
+        artist|album_artist) [[ -z "$author" ]] && author="$val" ;;
+        album)               [[ -z "$album"  ]] && album="$val" ;;
+        date|year)           [[ -z "$year"   ]] && year="${val[1,4]}" ;;
+      esac
+    done < <(
+      ffprobe -v error \
+        -show_entries format_tags=title,artist,album_artist,album,date,year \
+        -of default=noprint_wrappers=1 "$f" 2>/dev/null || true
+    )
+    [[ -n "$title" && -n "$author" ]] && break
+  done
+
+  if [[ -z "$title" && -z "$author" && -z "$album" && -z "$year" ]]; then
+    info "Metadata: none found in files"
+    return
+  fi
+
+  local out_meta="$INPUT_DIR/meta.txt"
+  {
+    print "# Auto-extracted by mkm4b"
+    [[ -n "$title"  ]] && print "title=$title"
+    [[ -n "$author" ]] && print "author=$author"
+    [[ -n "$album"  ]] && print "album=$album"
+    [[ -n "$year"   ]] && print "year=$year"
+  } > "$out_meta"
+
+  typeset -g META_FILE="$out_meta"
+  info "Metadata: extracted from files → meta.txt"
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Write the ffmetadata block to stdout.
+# Inline flags (OPT_*) take priority over META_FILE contents.
+# ──────────────────────────────────────────────────────────────────────────────
+write_ffmetadata() {
+  print ";FFMETADATA1"
+
+  # Track which keys are being supplied inline so we can skip them in the file
+  local -A has_inline=()
+  [[ -n "$OPT_TITLE"  ]] && has_inline[title]=1
+  [[ -n "$OPT_AUTHOR" ]] && has_inline[author]=1
+  [[ -n "$OPT_ALBUM"  ]] && has_inline[album]=1
+  [[ -n "$OPT_YEAR"   ]] && has_inline[year]=1
+
+  # Inline values first — ffmpeg uses first occurrence, so these win
+  [[ -n "$OPT_TITLE"  ]] && print "title=$OPT_TITLE"
+  [[ -n "$OPT_AUTHOR" ]] && print "author=$OPT_AUTHOR"
+  [[ -n "$OPT_ALBUM"  ]] && print "album=$OPT_ALBUM"
+  [[ -n "$OPT_YEAR"   ]] && print "year=$OPT_YEAR"
+
+  if [[ -n "$META_FILE" ]]; then
+    local raw trimmed k v
+    while IFS= read -r raw || [[ -n "$raw" ]]; do
+      trimmed="${raw#"${raw%%[^[:space:]]*}"}"
+      [[ -z "$trimmed" || "$trimmed" == \#* ]] && continue
+      k="${trimmed%%=*}"
+      v="${trimmed#*=}"
+      # Skip keys already written inline
+      [[ -n "${has_inline[$k]+1}" ]] && continue
+      print "$k=$v"
+    done < "$META_FILE"
+  else
+    # No meta file — folder name as title unless --title was given
+    [[ -z "$OPT_TITLE" ]] && print "title=${INPUT_DIR:t}"
+  fi
+
+  print ""
+
+  # Chapter blocks
+  local total=${#chap_starts[@]}
+  (( total == 0 )) && return
+
+  local pad=${#total}
+  local i start_ms end_ms num
+  for i in {1..$total}; do
+    start_ms="${chap_starts[i]}"
+    if (( i < total )); then
+      end_ms="${chap_starts[i+1]}"
+    else
+      end_ms=$total_ms
+    fi
+    num=$(printf "%0${pad}d" $i)
+    print "[CHAPTER]"
+    print "TIMEBASE=1/1000"
+    print "START=$start_ms"
+    print "END=$end_ms"
+    print "title=${num}. ${chap_titles[i]}"
+    print ""
+  done
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# main
+# ──────────────────────────────────────────────────────────────────────────────
+main() {
+
+  # ── defaults ────────────────────────────────────────────────────────────────
+  INPUT_DIR="."
+  OUTPUT="" META_FILE="" COVER=""
+  CHAPTER_MODE="files" SILENCE_SECS="3" SILENCE_THRESHOLD="35"
+  TRIM_ENDS=0 TRIM_BUFFER="1.0"
+  OPT_TITLE="" OPT_AUTHOR="" OPT_ALBUM="" OPT_YEAR=""
+  RECURSIVE=0 FORCE=0 SKIP=0 DRYRUN=0 VERBOSE=0 MONO=0
+
+  # ── parse args ──────────────────────────────────────────────────────────────
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -o)                    shift; OUTPUT="$1" ;;
+      -m)                    shift; META_FILE="$1" ;;
+      -a)                    shift; COVER="$1" ;;
+      -c)                    shift
+                             case "$1" in
+                               files|none) CHAPTER_MODE="$1" ;;
+                               silence=*)
+                                 CHAPTER_MODE="silence"
+                                 SILENCE_SECS="${1#silence=}"
+                                 [[ "$SILENCE_SECS" =~ '^[0-9]+(\.[0-9]+)?$' ]] \
+                                   || die "silence= needs a number (e.g. -c silence=3.5)" ;;
+                               *) die "Unknown chapter mode: '$1'  valid: files, none, silence=N" ;;
+                             esac ;;
+      -r)                    RECURSIVE=1 ;;
+      -f)                    FORCE=1 ;;
+      -s)                    SKIP=1 ;;
+      -n)                    DRYRUN=1 ;;
+      -v)                    VERBOSE=1 ;;
+      --mono)                MONO=1 ;;
+      --trim-ends)           TRIM_ENDS=1 ;;
+      --trim-ends=*)         TRIM_ENDS=1; TRIM_BUFFER="${1#--trim-ends=}" ;;
+      --silence-threshold=*) SILENCE_THRESHOLD="${1#--silence-threshold=}" ;;
+      --title)               shift; OPT_TITLE="$1" ;;
+      --title=*)             OPT_TITLE="${1#--title=}" ;;
+      --author)              shift; OPT_AUTHOR="$1" ;;
+      --author=*)            OPT_AUTHOR="${1#--author=}" ;;
+      --album)               shift; OPT_ALBUM="$1" ;;
+      --album=*)             OPT_ALBUM="${1#--album=}" ;;
+      --year)                shift; OPT_YEAR="$1" ;;
+      --year=*)              OPT_YEAR="${1#--year=}" ;;
+      -h|--help)             print_help; exit 0 ;;
+      --version)             print "mkm4b $VERSION"; exit 0 ;;
+      --)                    shift; break ;;
+      -*)                    die "Unknown option: $1  (try -h)" ;;
+      *)                     INPUT_DIR="$1" ;;
+    esac
+    shift
+  done
+
+  # ── validate numeric args ───────────────────────────────────────────────────
+  [[ "$SILENCE_THRESHOLD" =~ '^[0-9]+(\.[0-9]+)?$' ]] \
+    || die "--silence-threshold needs a positive number (e.g. --silence-threshold=35)"
+  [[ "$TRIM_BUFFER" =~ '^[0-9]+(\.[0-9]+)?$' ]] \
+    || die "--trim-ends value needs a positive number in seconds (e.g. --trim-ends=1.5)"
+
+  # ── dep check ───────────────────────────────────────────────────────────────
+  check_deps
+
+  # ── resolve paths ───────────────────────────────────────────────────────────
+  INPUT_DIR="$("$REALPATH" "$INPUT_DIR")"
+  [[ -d "$INPUT_DIR" ]] || die "Not a directory: $INPUT_DIR"
+
+  [[ -z "$OUTPUT" ]] && OUTPUT="${INPUT_DIR:t}.m4b"
+  [[ "$OUTPUT" != */* ]] && OUTPUT="$PWD/$OUTPUT"
+  OUTPUT="$("$REALPATH" -m "$OUTPUT")"
+
+  if [[ -f "$OUTPUT" ]]; then
+    if   [[ $SKIP  -eq 1 ]]; then info "⏭   Skipping — already exists: ${OUTPUT:t}"; exit 0
+    elif [[ $FORCE -ne 1 ]]; then die "Output already exists: $OUTPUT  (use -f to overwrite, -s to skip)"
+    fi
+  fi
+
+  if [[ -n "$META_FILE" ]]; then
+    META_FILE="$("$REALPATH" "$META_FILE")"
+    [[ -f "$META_FILE" ]] || die "Metadata file not found: $META_FILE"
+  fi
+
+  if [[ -n "$COVER" ]]; then
+    COVER="$("$REALPATH" "$COVER")"
+    [[ -f "$COVER" ]] || die "Cover image not found: $COVER"
+    [[ "$COVER" =~ '\.(jpe?g|png)$' ]] \
+      || warn "Cover doesn't look like jpg/png — attempting anyway"
+  fi
+
+  # ── collect files ───────────────────────────────────────────────────────────
+  files=()
+  collect_files
+  (( ${#files[@]} > 0 )) || die "No supported audio files found in: $INPUT_DIR"
+  info "Found ${#files[@]} file(s) in ${INPUT_DIR:t}/"
+
+  # ── auto-scan cover + metadata ──────────────────────────────────────────────
+  [[ -z "$COVER"     ]] && auto_scan_cover
+  [[ -z "$META_FILE" ]] && auto_scan_meta
+
+  # ── temp dir ────────────────────────────────────────────────────────────────
+  MKM4B_TMPDIR=$(mktemp -d)
+  local concat="$MKM4B_TMPDIR/concat.txt"
+  local metafile="$MKM4B_TMPDIR/meta.ffmeta"
+
+  # ── probe / trim / concat list ──────────────────────────────────────────────
+  durations=()
+  total_ms=0
+
+  info "Probing files..."
+  [[ $TRIM_ENDS -eq 1 ]] && info "  (trimming ends to −${SILENCE_THRESHOLD} dBFS, ${TRIM_BUFFER}s buffer)"
+
+  local f dm orig_dm use_f secs_display orig_secs escaped trim_result
+  local idx=0
+
+  for f in "${files[@]}"; do
+    (( ++idx )) || :
+    [[ -r "$f" ]] || die "Cannot read: $f"
+
+    orig_dm=$(probe_duration_ms "$f")
+    use_f="$f"
+    dm="$orig_dm"
+
+    if [[ $TRIM_ENDS -eq 1 ]]; then
+      local tmp_path="$MKM4B_TMPDIR/t${idx}.${f:e}"
+      trim_result=$(trim_file_ends "$f" "$orig_dm" "$tmp_path")
+      use_f="${trim_result%% *}"
+      dm="${trim_result##* }"
+    fi
+
+    durations+=($dm)
+    (( total_ms += dm )) || :
+
+    secs_display=$(awk "BEGIN { printf \"%.1f\", $dm / 1000 }")
+
+    if [[ "$use_f" != "$f" ]]; then
+      orig_secs=$(awk "BEGIN { printf \"%.1f\", $orig_dm / 1000 }")
+      info "  ✓ ${f:t}  (${orig_secs}s → ${secs_display}s)"
+    else
+      info "  ✓ ${f:t}  (${secs_display}s)"
+    fi
+
+    escaped="${use_f//\'/\'\\\'\'}"
+    print "file '$escaped'" >> "$concat"
+  done
+
+  local total_hms
+  total_hms=$(awk "BEGIN {
+    s = int($total_ms / 1000)
+    printf \"%d:%02d:%02d\", int(s/3600), int((s%3600)/60), s%60
+  }")
+  info "Total: $total_hms"
+
+  # ── compute chapter data ────────────────────────────────────────────────────
+  chap_starts=()
+  chap_titles=()
+
+  if [[ "$CHAPTER_MODE" == "files" ]]; then
+    local cursor=0 idx2
+    for idx2 in {1..${#files[@]}}; do
+      chap_starts+=($cursor)
+      chap_titles+=("$(clean_title "${files[idx2]:t:r}")")
+      (( cursor += durations[idx2] )) || :
+    done
+
+  elif [[ "$CHAPTER_MODE" == "silence" ]]; then
+    info "Detecting silence (>= ${SILENCE_SECS}s, threshold −${SILENCE_THRESHOLD} dBFS)..."
+    local cursor=0 found_any=0 idx3 se base_title
+    for idx3 in {1..${#files[@]}}; do
+      f="${files[idx3]}"
+      dm="${durations[idx3]}"
+      base_title="$(clean_title "${f:t:r}")"
+
+      chap_starts+=($cursor)
+      chap_titles+=("$base_title")
+
+      while IFS= read -r se; do
+        [[ -n "$se" ]] || continue
+        chap_starts+=($(( cursor + se )))
+        chap_titles+=("$base_title (cont.)")
+        found_any=1
+      done < <(detect_silence_ends "$f" "$dm")
+
+      (( cursor += dm )) || :
+    done
+
+    if (( found_any == 0 )); then
+      warn "No silence >= ${SILENCE_SECS}s found — falling back to 'files' mode"
+    else
+      info "Chapters: ${#chap_starts[@]}"
+    fi
+  fi
+
+  # ── write ffmetadata ────────────────────────────────────────────────────────
+  write_ffmetadata > "$metafile"
+
+  # ── dry run ─────────────────────────────────────────────────────────────────
+  if [[ $DRYRUN -eq 1 ]]; then
+    info "Dry run — nothing written"
+    print "\n── files (in order) ─────────────────────────────────────────────"
+    for f in "${files[@]}"; do print "  $f"; done
+    print "\n── ffmetadata ───────────────────────────────────────────────────"
+    cat "$metafile"
+    exit 0
+  fi
+
+  # ── encode ──────────────────────────────────────────────────────────────────
+  info "Encoding → ${OUTPUT:t} ..."
+
+  local ff_loglevel="warning"
+  [[ $VERBOSE -eq 1 ]] && ff_loglevel="info"
+
+  local -a ff_overwrite=()
+  [[ $FORCE -eq 1 ]] && ff_overwrite=(-y)
+
+  local audio_channels=2 audio_bitrate="128k"
+  [[ $MONO -eq 1 ]] && { audio_channels=1; audio_bitrate="64k" }
+
+  local -a ff_inputs=(-f concat -safe 0 -i "$concat" -i "$metafile")
+  local -a ff_maps=(-map 0:a -map_metadata 1)
+  local -a ff_video=(-vn)
+  local -a ff_cover_enc=()
+
+  if [[ -n "$COVER" ]]; then
+    ff_inputs+=(-i "$COVER")
+    ff_maps+=(-map 2:v)
+    ff_video=()
+    ff_cover_enc=(
+      -c:v copy
+      -disposition:v attached_pic
+      -metadata:s:v title="Album cover"
+      -metadata:s:v comment="Cover (front)"
+    )
+  fi
+
+  ffmpeg \
+    -hide_banner -loglevel "$ff_loglevel" -stats \
+    "${ff_overwrite[@]}" \
+    "${ff_inputs[@]}" \
+    "${ff_maps[@]}" \
+    "${ff_video[@]}" \
+    -ar 44100 -ac $audio_channels \
+    -c:a aac -b:a $audio_bitrate \
+    "${ff_cover_enc[@]}" \
+    -movflags +faststart \
+    "$OUTPUT"
+
+  # ── size report ─────────────────────────────────────────────────────────────
+  local input_bytes=0 f_bytes
+  for f in "${files[@]}"; do
+    f_bytes=$(file_size_bytes "$f")
+    (( input_bytes += f_bytes )) || :
+  done
+
+  local output_bytes
+  output_bytes=$(file_size_bytes "$OUTPUT")
+
+  awk -v ib="$input_bytes" -v ob="$output_bytes" -v n="${#files[@]}" 'BEGIN {
+    imb = ib / 1048576
+    omb = ob / 1048576
+    pct = (ib > 0) ? (1 - ob/ib) * 100 : 0
+    printf "→  Input:  %d file(s)   %.1f MB\n", n, imb
+    printf "→  Output: %.1f MB  (%.0f%% smaller)\n", omb, pct
+  }'
+
+  print "\n✅  Done: $OUTPUT"
+}
+
+main "$@"

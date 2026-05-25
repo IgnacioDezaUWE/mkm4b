@@ -1,0 +1,18 @@
+# Audio files — don't commit recordings
+*.mp3
+*.m4a
+*.m4b
+*.aac
+*.wav
+*.flac
+
+# Auto-extracted files that mkm4b writes to input folders
+cover.jpg
+cover.png
+cover2.jpg
+cover2.png
+meta.txt
+meta2.txt
+
+# macOS
+.DS_Store
