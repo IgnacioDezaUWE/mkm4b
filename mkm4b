@@ -44,6 +44,11 @@ Performance:
 
 Audio:
   --mono                    Encode as mono 64k (default: stereo 128k)
+  --strict                  Abort on errors that degrade output quality
+                              (failed encode job, failed trim). By default
+                              mkm4b warns and continues, useful for overnight
+                              batch runs. Use --strict when debugging a
+                              specific problem folder.
 
 Metadata overrides (override -m / auto-detected values for this run):
   --title=TEXT              Set title
@@ -61,7 +66,8 @@ Silence tuning:
                               Used with: -c files (trims around each chapter)
 
 Supported input formats:
-  mp3, m4a, aac, wav, flac
+  Audio: mp3, m4a, aac, wav, flac
+  Video: mp4, mov, mkv, avi, webm, m4v  (audio track extracted automatically)
 
 Auto-detection (when -m / -a are omitted):
   Looks for cover.jpg and meta.txt in the input folder. If absent, scans the
@@ -162,7 +168,7 @@ typeset -g  INPUT_DIR="" OUTPUT="" META_FILE="" COVER=""
 typeset -g  CHAPTER_MODE="files" SILENCE_SECS="3" SILENCE_THRESHOLD="35"
 typeset -g  TRIM_BUFFER="1.0"
 typeset -g  OPT_TITLE="" OPT_AUTHOR="" OPT_ALBUM="" OPT_YEAR=""
-typeset -gi RECURSIVE=0 FORCE=0 SKIP=0 DRYRUN=0 VERBOSE=0 MONO=0 TRIM_ENDS=0 JOBS=0
+typeset -gi RECURSIVE=0 FORCE=0 SKIP=0 DRYRUN=0 VERBOSE=0 MONO=0 TRIM_ENDS=0 JOBS=0 STRICT=0
 typeset -g  total_ms=0
 typeset -ga files=() durations=() chap_starts=() chap_titles=()
 
@@ -185,8 +191,10 @@ collect_files() {
   find_cmd+=(
     -type f
     \(
-      -iname "*.mp3" -o -iname "*.m4a" -o -iname "*.aac"
-      -o -iname "*.wav" -o -iname "*.flac"
+      -iname "*.mp3"  -o -iname "*.m4a"  -o -iname "*.aac"
+      -o -iname "*.wav"  -o -iname "*.flac"
+      -o -iname "*.mp4"  -o -iname "*.mov"  -o -iname "*.mkv"
+      -o -iname "*.avi"  -o -iname "*.webm" -o -iname "*.m4v"
     \)
   )
   local f
@@ -292,11 +300,23 @@ trim_file_ends() {
   start_s=$(awk "BEGIN { printf \"%.3f\", $trim_start_ms / 1000 }")
   dur_s=$(awk   "BEGIN { printf \"%.3f\", $new_dur_ms    / 1000 }")
 
-  if ffmpeg -hide_banner -loglevel error \
+  local trim_ok=1
+  if (( VERBOSE )); then
+    ffmpeg -hide_banner -loglevel info \
       -ss "$start_s" -t "$dur_s" -i "$f" \
-      -c copy "$out_file" -y 2>/dev/null; then
+      -c copy "$out_file" -y || trim_ok=0
+  else
+    ffmpeg -hide_banner -loglevel error \
+      -ss "$start_s" -t "$dur_s" -i "$f" \
+      -c copy "$out_file" -y 2>/dev/null || trim_ok=0
+  fi
+
+  if (( trim_ok )); then
     print "$out_file $new_dur_ms"
   else
+    if (( STRICT )); then
+      die "Trim failed for ${f:t} — aborting (--strict)"
+    fi
     warn "Trim failed for ${f:t} — using original"
     print "$f $orig_dur_ms"
   fi
@@ -528,7 +548,7 @@ main() {
   CHAPTER_MODE="files" SILENCE_SECS="3" SILENCE_THRESHOLD="35"
   TRIM_ENDS=0 TRIM_BUFFER="1.0"
   OPT_TITLE="" OPT_AUTHOR="" OPT_ALBUM="" OPT_YEAR=""
-  RECURSIVE=0 FORCE=0 SKIP=0 DRYRUN=0 VERBOSE=0 MONO=0 JOBS=0
+  RECURSIVE=0 FORCE=0 SKIP=0 DRYRUN=0 VERBOSE=0 MONO=0 JOBS=0 STRICT=0
 
   # ── parse args ──────────────────────────────────────────────────────────────
   while [[ $# -gt 0 ]]; do
@@ -552,6 +572,7 @@ main() {
       -n)                    DRYRUN=1 ;;
       -v)                    VERBOSE=1 ;;
       --mono)                MONO=1 ;;
+      --strict)              STRICT=1 ;;
       --jobs=*)
         local _jv="${1#--jobs=}"
         [[ "$_jv" =~ '^-?[0-9]+$' ]] \
@@ -695,9 +716,10 @@ main() {
     info "Encoding ${n_files} file(s) with ${JOBS} parallel job(s)..."
     [[ $TRIM_ENDS -eq 1 ]] && info "  (trimming ends to −${SILENCE_THRESHOLD} dBFS, ${TRIM_BUFFER}s buffer)"
 
-    # Suppress per-job output to avoid interleaved noise; verbose shows warnings
+    # In verbose mode show full ffmpeg output per job; otherwise errors only
+    # (output is redirected to a log file anyway, shown only on failure)
     local ff_loglevel_enc="error"
-    [[ $VERBOSE -eq 1 ]] && ff_loglevel_enc="warning"
+    if (( VERBOSE )); then ff_loglevel_enc="info"; fi
 
     local -a enc_files=() enc_pids=()
     local enc_head=0 enc_idx=0
@@ -736,8 +758,11 @@ main() {
       while (( ${#enc_pids[@]} - enc_head >= JOBS )); do
         if ! kill -0 "${enc_pids[$((enc_head+1))]}" 2>/dev/null; then
           if ! wait "${enc_pids[$((enc_head+1))]}"; then
-            warn "Encode job $((enc_head+1)) failed — ffmpeg output:"
             cat "$MKM4B_TMPDIR/enc_$((enc_head+1)).log" >&2
+            if (( STRICT )); then
+              die "Encode job $((enc_head+1)) failed — aborting (--strict)"
+            fi
+            warn "Encode job $((enc_head+1)) failed (output above) — continuing"
           fi
           (( ++enc_head )) || :
         else
@@ -745,10 +770,13 @@ main() {
         fi
       done
 
-      # Redirect per-job stderr to a log file; shown only on failure.
-      # This silences harmless source-file warnings (e.g. malformed ID3 GEOB
-      # frames) without hiding real errors.
-      ffmpeg "${ff_enc[@]}" 2>"$MKM4B_TMPDIR/enc_${enc_idx}.log" &
+      # In verbose mode show ffmpeg output live; otherwise redirect to a log
+      # file that is only printed if the job fails (suppresses GEOB noise etc.)
+      if (( VERBOSE )); then
+        ffmpeg "${ff_enc[@]}" &
+      else
+        ffmpeg "${ff_enc[@]}" 2>"$MKM4B_TMPDIR/enc_${enc_idx}.log" &
+      fi
       enc_pids+=($!)
     done
 
@@ -756,8 +784,11 @@ main() {
     local drain_i
     for (( drain_i = enc_head; drain_i < ${#enc_pids[@]}; drain_i++ )); do
       if ! wait "${enc_pids[$((drain_i+1))]}"; then
-        warn "Encode job $((drain_i+1)) failed — ffmpeg output:"
         cat "$MKM4B_TMPDIR/enc_$((drain_i+1)).log" >&2
+        if (( STRICT )); then
+          die "Encode job $((drain_i+1)) failed — aborting (--strict)"
+        fi
+        warn "Encode job $((drain_i+1)) failed (output above) — continuing"
       fi
     done
 

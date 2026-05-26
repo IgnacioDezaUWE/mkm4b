@@ -1,6 +1,6 @@
 # mkm4b
 
-Convert a folder of audio recordings into a single **M4B audiobook** with chapters, cover art, and embedded metadata.
+Convert a folder of audio or video recordings into a single **M4B audiobook** with chapters, cover art, and embedded metadata.
 
 Designed for lectures, conference talks, student vivas, and anything else you'd rather listen to at 1.5× speed on your phone.
 
@@ -8,10 +8,11 @@ Designed for lectures, conference talks, student vivas, and anything else you'd 
 
 ## Features
 
-- Merges any number of audio files into one M4B
+- Merges any number of audio or video files into one M4B
 - Embeds **chapter markers**: one per file, or split automatically at silence gaps
 - **Auto-detects** cover art and metadata already embedded in your files
 - Caches extracted `cover.jpg` and `meta.txt` in the folder so re-runs are instant
+- **Parallel encoding** with `--jobs=-1` — use all CPU cores for large backlogs
 - Natural sort order: `lecture-2` always comes before `lecture-10`
 - Works on **macOS and Linux**
 
@@ -94,7 +95,7 @@ mkm4b [DIRECTORY] [OPTIONS]
 | `-f` | Overwrite existing output file |
 | `-s` | Skip silently if output already exists (useful in batch loops) |
 | `-n` | Dry run: show exactly what would happen, write nothing |
-| `-v` | Verbose: show full ffmpeg output |
+| `-v` | Verbose: show full ffmpeg output for all passes |
 | `-h` | Help |
 | `--version` | Print version |
 
@@ -108,9 +109,10 @@ mkm4b [DIRECTORY] [OPTIONS]
 
 | Option | Description |
 |---|---|
-| `--mono` | Encode as mono 64k (default: stereo 128k: good for recordings with spatial audio) |
+| `--mono` | Encode as mono 64k (default: stereo 128k) |
+| `--strict` | Abort on any error that would degrade the output (failed encode job, failed trim). Default behaviour is to warn and continue — useful for overnight batch runs. Use `--strict` when debugging a specific problem folder. |
 
-**Metadata overrides**: set individual fields without a `meta.txt`:
+**Metadata overrides** — set individual fields without a `meta.txt`:
 
 | Option | Description |
 |---|---|
@@ -128,7 +130,12 @@ These take priority over `-m` and auto-detected values for that run only. The ca
 | `--silence-threshold=N` | Level below which audio counts as silence, in dB below full scale (default: `35` → −35 dBFS). Higher = more aggressive. Try `25` for noisy rooms / loud AC. |
 | `--trim-ends[=SECS]` | Strip leading/trailing silence from each file before joining. Keeps SECS seconds of buffer on each side (default: `1.0`). |
 
-**Supported input formats:** `mp3`, `m4a`, `aac`, `wav`, `flac`
+**Supported input formats:**
+
+| Type | Formats |
+|---|---|
+| Audio | `mp3`, `m4a`, `aac`, `wav`, `flac` |
+| Video | `mp4`, `mov`, `mkv`, `avi`, `webm`, `m4v` — audio track extracted automatically, video discarded |
 
 ---
 
@@ -178,8 +185,9 @@ When you don't pass `-m` or `-a`, mkm4b looks inside the input folder and the au
 
 1. Looks for `meta.txt` in the input folder: uses it if valid
 2. If not found, reads embedded tags (`title`, `artist`, `album`, `date`) from the first file that has them
-3. Saves the extracted tags to `meta.txt` for next time
-4. If `meta.txt` exists but is empty or malformed, backs it up to `meta2.txt`
+3. Uses the `album` tag as the M4B title when available — the album names the collection, which is more meaningful than the per-file title tag
+4. Saves the extracted tags to `meta.txt` for next time
+5. If `meta.txt` exists but is empty or malformed, backs it up to `meta2.txt`
 
 This means the first run on any folder does the work; every subsequent run is instant.
 
@@ -192,13 +200,23 @@ A plain text file with one `key=value` per line. Lines starting with `#` are com
 ```
 # meta.txt
 title=Introduction to Machine Learning
-author= My Fav Lecturer
+author=Dr Ignacio Deza
 album=Data Science Lectures 2026
 year=2026
 ```
 
 Pass it explicitly with `-m`, or just place it in the input folder as `meta.txt`
 and mkm4b will find it automatically.
+
+### Metadata priority (highest → lowest)
+
+1. `--title` / `--author` / `--album` / `--year` flags
+2. `-m file.txt`
+3. `meta.txt` in the input folder (auto-detected cache)
+4. Tags embedded in the audio files
+5. Folder name (title only, last resort)
+
+Inline flags (`--title` etc.) only affect the current run — the cached `meta.txt` is never modified.
 
 ---
 
@@ -235,14 +253,17 @@ mkm4b lectures/ --jobs=-1
 # Parallel encode + trim ends in one shot
 mkm4b lectures/ --jobs=-1 --trim-ends
 
+# Stop immediately if anything goes wrong
+mkm4b lectures/ --jobs=-1 --strict
+
 # Preview without writing
 mkm4b lectures/ -n
 
-# Verbose output (see full ffmpeg log)
+# Verbose output (see full ffmpeg log for all passes)
 mkm4b lectures/ -v
 ```
 
-### Processing many folders in parallel
+### Processing a backlog of folders
 
 ```bash
 for folder in */; do
@@ -252,9 +273,14 @@ done
 
 The `-s` flag skips any folder that already has an output file, so you can
 safely re-run the loop after adding new folders. `--jobs=-1` uses all CPU cores
-for each folder, so encoding runs as fast as your hardware allows. mkm4b
-auto-extracts metadata and cover art from each folder's files on the first run,
-then reuses them.
+for each folder. mkm4b auto-extracts metadata and cover art from each folder's
+files on the first run, then reuses them.
+
+When something fails overnight, re-run with `--strict` and `-v` on that folder:
+
+```bash
+mkm4b problem-folder/ --strict -v -f
+```
 
 ---
 
@@ -262,8 +288,9 @@ then reuses them.
 
 - **File order** is determined by natural sort: you don't need to pad numbers manually. `lecture-2.mp3` and `lecture-10.mp3` sort correctly as-is.
 - **Existing tags are respected**: if your files already have cover art and metadata embedded, mkm4b picks them up automatically with no extra flags.
-- **Dry run**: `mkm4b lectures/ -n` shows you the file order, chapter layout, and full metadata block before committing to an encode.
-- **Re-encode**: the auto-extracted `meta.txt` and `cover.jpg` in each folder act as a persistent cache. Edit them before re-running to correct any tags.
+- **Dry run first**: `mkm4b lectures/ -n` shows you the file order, chapter layout, and full metadata block before committing to an encode.
+- **Re-encode freely**: the auto-extracted `meta.txt` and `cover.jpg` in each folder act as a persistent cache. Edit them before re-running to correct any tags.
+- **Video files**: the audio track is extracted and the video is discarded. If your recordings are MP4s from Panopto, Zoom, or a screen recorder, they work exactly like audio files.
 
 ---
 
