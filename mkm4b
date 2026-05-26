@@ -378,7 +378,9 @@ auto_scan_cover() {
     break
   done
 
-  [[ -z "$out_cover" ]] && info "Cover: none found"
+  if [[ -z "$out_cover" ]]; then
+    info "Cover: none found"
+  fi
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -445,9 +447,9 @@ auto_scan_meta() {
     elif [[ -n "$title" ]]; then
       print "title=$title"
     fi
-    [[ -n "$author" ]] && print "author=$author"
-    [[ -n "$album"  ]] && print "album=$album"
-    [[ -n "$year"   ]] && print "year=$year"
+    if [[ -n "$author" ]]; then print "author=$author"; fi
+    if [[ -n "$album"  ]]; then print "album=$album";  fi
+    if [[ -n "$year"   ]]; then print "year=$year";    fi
   } > "$out_meta"
 
   typeset -g META_FILE="$out_meta"
